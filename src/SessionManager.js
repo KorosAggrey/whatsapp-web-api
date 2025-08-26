@@ -1,37 +1,36 @@
-// SessionManager.js - Enhanced Session Management with QR timeout handling
+// SessionManager.js - Enhanced Session Management with QR timeout handling + logging
 
 import pkg from 'whatsapp-web.js';
 const { Client, LocalAuth } = pkg;
 import { EventEmitter } from 'events';
 import { existsSync, readdirSync } from 'fs';
 import { join } from 'path';
+import axios from 'axios';
 
-// Get MessageMedia from the same package
 const MessageMedia = pkg.MessageMedia || pkg.default?.MessageMedia;
 
 export class SessionManager extends EventEmitter {
   constructor() {
     super();
     this.sessions = new Map();
-    this.qrStates = new Map(); // Track QR generation state
+    this.qrStates = new Map();
     this.AUTH_DIR = process.env.AUTH_DIR || './.wwebjs_auth';
   }
 
-  // Check if session exists on disk
   sessionExistsOnDisk(sessionId) {
     const sessionPath = join(this.AUTH_DIR, `session-${sessionId}`);
-    return existsSync(sessionPath);
+    const exists = existsSync(sessionPath);
+    console.log(`[SessionManager] sessionExistsOnDisk(${sessionId}) -> ${exists}`);
+    return exists;
   }
 
-  // Load session from disk if it exists
   async loadSessionFromDisk(sessionId) {
     if (!this.sessionExistsOnDisk(sessionId)) {
+      console.log(`[SessionManager] No session on disk for ${sessionId}`);
       return null;
     }
 
-    console.log(`Loading session ${sessionId} from disk`);
-
-    // Create session object
+    console.log(`[SessionManager] Loading session ${sessionId} from disk`);
     const session = {
       id: sessionId,
       client: null,
@@ -39,16 +38,13 @@ export class SessionManager extends EventEmitter {
       info: null,
       qr: null,
       createdAt: new Date(),
+      webhook: null,
     };
 
     this.sessions.set(sessionId, session);
 
-    // Initialize client with existing session
     const client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: sessionId,
-        dataPath: this.AUTH_DIR,
-      }),
+      authStrategy: new LocalAuth({ clientId: sessionId, dataPath: this.AUTH_DIR }),
       puppeteer: {
         headless: true,
         executablePath:
@@ -57,53 +53,50 @@ export class SessionManager extends EventEmitter {
             : undefined,
         args: ['--no-sandbox', '--disable-setuid-sandbox'],
       },
-      qrMaxRetries: 1, // Important: Only 1 attempt after 60s
+      qrMaxRetries: 1,
     });
 
     session.client = client;
-
-    // Set up event handlers
     this.setupClientEvents(sessionId, client);
 
-    // Initialize client
     try {
       await client.initialize();
-      // Wait a bit for the client to restore session
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await new Promise((r) => setTimeout(r, 2000));
+      console.log(`[SessionManager] Session ${sessionId} initialized from disk`);
       return session;
     } catch (error) {
-      console.error(`Failed to load session ${sessionId} from disk:`, error);
+      console.error(
+        `[SessionManager] Failed to load session ${sessionId} from disk:`,
+        error.message
+      );
       this.sessions.delete(sessionId);
       return null;
     }
   }
 
-  // Check if QR is currently active (within 60s window)
   isQRActive(sessionId) {
     const qrState = this.qrStates.get(sessionId);
-    if (!qrState || !qrState.active) {
-      return false;
-    }
-
-    const elapsed = Date.now() - qrState.timestamp;
-    return elapsed < 60000; // 60 seconds
+    const active = qrState && qrState.active && Date.now() - qrState.timestamp < 60000;
+    console.log(`[SessionManager] isQRActive(${sessionId}) -> ${active}`);
+    return active;
   }
 
-  // Get remaining time for active QR
   getQRTimeRemaining(sessionId) {
     const qrState = this.qrStates.get(sessionId);
     if (!qrState || !qrState.active) {
       return 0;
     }
-
     const elapsed = Date.now() - qrState.timestamp;
     const remaining = Math.max(0, 60 - Math.floor(elapsed / 1000));
+    console.log(`[SessionManager] getQRTimeRemaining(${sessionId}) -> ${remaining}s`);
     return remaining;
   }
 
-  // Create new session
   async createSession(sessionId) {
+    console.log(`[SessionManager] Creating session ${sessionId}`);
+
     if (this.sessions.has(sessionId)) {
+      console.error(`[SessionManager] Session ${sessionId} already exists`);
       throw new Error('Session already exists');
     }
 
@@ -114,106 +107,76 @@ export class SessionManager extends EventEmitter {
       info: null,
       qr: null,
       createdAt: new Date(),
+      webhook: null,
     };
 
     this.sessions.set(sessionId, session);
 
-    // Initialize client
     const client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: sessionId,
-        dataPath: this.AUTH_DIR,
-      }),
-      puppeteer: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      },
-      qrMaxRetries: 1, // Important: Only 1 attempt after 60s
+      authStrategy: new LocalAuth({ clientId: sessionId, dataPath: this.AUTH_DIR }),
+      puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+      qrMaxRetries: 1,
     });
 
     session.client = client;
-
-    // Set up event handlers
     this.setupClientEvents(sessionId, client);
 
-    // Initialize but don't wait
     client.initialize().catch((err) => {
-      console.error(`Failed to initialize session ${sessionId}:`, err);
+      console.error(`[SessionManager] Failed to initialize session ${sessionId}:`, err.message);
       session.status = 'error';
       session.error = err.message;
     });
 
-    return {
-      sessionId,
-      status: session.status,
-      message: 'Session created, initializing...',
-    };
+    return { sessionId, status: session.status, message: 'Session created, initializing...' };
   }
 
-  // Generate QR code with timeout handling
   async generateQR(sessionId) {
+    console.log(`[SessionManager] generateQR(${sessionId}) called`);
     let session = this.sessions.get(sessionId);
 
-    // If not in memory, try to load from disk
     if (!session && this.sessionExistsOnDisk(sessionId)) {
       session = await this.loadSessionFromDisk(sessionId);
     }
 
     if (!session) {
+      console.error(`[SessionManager] No session found for QR generation: ${sessionId}`);
       throw new Error('Session not found');
     }
 
-    // Restart if disconnected (QR expired)
     if (session.status === 'disconnected') {
-      console.log(`Restarting disconnected session ${sessionId}`);
-
-      // Clean up old session
+      console.log(`[SessionManager] Restarting disconnected session ${sessionId}`);
       if (session.client) {
         await session.client.destroy().catch(() => {});
       }
       this.sessions.delete(sessionId);
       this.qrStates.delete(sessionId);
-
-      // Create fresh session
       await this.createSession(sessionId);
       session = this.sessions.get(sessionId);
     }
 
-    // If already authenticated, return success
     if (session.status === 'ready') {
-      return {
-        status: 'ready',
-        message: 'Session already authenticated',
-        info: session.info,
-      };
+      console.log(`[SessionManager] Session ${sessionId} already authenticated`);
+      return { status: 'ready', message: 'Session already authenticated', info: session.info };
     }
 
-    // If QR is already active, throw error
     if (this.isQRActive(sessionId)) {
+      console.warn(`[SessionManager] QR already active for ${sessionId}`);
       throw new Error('QR generation already in progress');
     }
 
-    // Mark QR as active
-    this.qrStates.set(sessionId, {
-      active: true,
-      timestamp: Date.now(),
-      qr: null,
-    });
-
-    // Set up QR timeout
+    this.qrStates.set(sessionId, { active: true, timestamp: Date.now(), qr: null });
     setTimeout(() => {
       const qrState = this.qrStates.get(sessionId);
       if (qrState && qrState.active) {
         qrState.active = false;
+        console.warn(`[SessionManager] QR expired for ${sessionId}`);
         this.emit('qr:expired', { sessionId });
       }
     }, 60000);
 
-    // If QR already available, return it
     if (session.qr) {
-      const qrState = this.qrStates.get(sessionId);
-      qrState.qr = session.qr;
-
+      console.log(`[SessionManager] Returning cached QR for ${sessionId}`);
+      this.qrStates.get(sessionId).qr = session.qr;
       return {
         status: 'qr',
         qr: session.qr,
@@ -228,20 +191,19 @@ export class SessionManager extends EventEmitter {
       };
     }
 
-    // Wait for QR with timeout
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        console.error(`[SessionManager] QR generation timeout for ${sessionId}`);
         reject(new Error('QR generation timeout'));
       }, 10000);
 
-      const qrHandler = (qr) => {
+      session.client.once('qr', (qr) => {
         clearTimeout(timeout);
-
+        console.log(`[SessionManager] QR generated for ${sessionId}`);
         const qrState = this.qrStates.get(sessionId);
         if (qrState) {
           qrState.qr = qr;
         }
-
         resolve({
           status: 'qr',
           qr,
@@ -254,38 +216,25 @@ export class SessionManager extends EventEmitter {
             '4. Scan this QR code within 60 seconds',
           ],
         });
-      };
-
-      session.client.once('qr', qrHandler);
+      });
     });
   }
 
-  // Replace existing session
   async replaceSession(sessionId, options = {}) {
-    const { preserveState = false } = options;
-
-    // Get existing session
+    console.log(
+      `[SessionManager] Replacing session ${sessionId}, preserveState=${options.preserveState}`
+    );
     const existingSession = this.sessions.get(sessionId);
     let savedState = null;
 
-    if (existingSession && preserveState && existingSession.status === 'ready') {
-      // Note: WhatsApp Web.js doesn't support state export/import
-      // This is a placeholder for future implementation
-      savedState = {
-        info: existingSession.info,
-        createdAt: existingSession.createdAt,
-      };
+    if (existingSession && options.preserveState && existingSession.status === 'ready') {
+      savedState = { info: existingSession.info, createdAt: existingSession.createdAt };
     }
 
-    // Destroy existing session
     if (existingSession) {
       await this.destroySession(sessionId);
     }
-
-    // Wait a bit for cleanup
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    // Create new session
+    await new Promise((r) => setTimeout(r, 1000));
     const result = await this.createSession(sessionId);
 
     if (savedState) {
@@ -294,26 +243,31 @@ export class SessionManager extends EventEmitter {
       newSession.previousState = savedState;
     }
 
-    return {
-      ...result,
-      replaced: true,
-      preservedState: preserveState,
-    };
+    return { ...result, replaced: true, preservedState: options.preserveState };
   }
 
-  // Get session status
-  async getSessionStatus(sessionId) {
+  async setWebhook(sessionId, webhook) {
+    console.log(`[SessionManager] Setting webhook for ${sessionId} -> ${webhook}`);
     let session = this.sessions.get(sessionId);
-
-    // If not in memory, try to load from disk
     if (!session && this.sessionExistsOnDisk(sessionId)) {
       session = await this.loadSessionFromDisk(sessionId);
     }
-
     if (!session) {
       throw new Error('Session not found');
     }
+    session.webhook = webhook;
+    return this.getSessionStatus(sessionId);
+  }
 
+  async getSessionStatus(sessionId) {
+    console.log(`[SessionManager] getSessionStatus(${sessionId})`);
+    let session = this.sessions.get(sessionId);
+    if (!session && this.sessionExistsOnDisk(sessionId)) {
+      session = await this.loadSessionFromDisk(sessionId);
+    }
+    if (!session) {
+      throw new Error('Session not found');
+    }
     return {
       sessionId,
       status: session.status,
@@ -322,63 +276,54 @@ export class SessionManager extends EventEmitter {
       qrTimeRemaining: this.getQRTimeRemaining(sessionId),
       createdAt: session.createdAt,
       replacedAt: session.replacedAt,
+      webhook: session.webhook,
     };
   }
 
-  // Send message (text or media)
   async sendMessage(sessionId, params) {
+    console.log(`[SessionManager] sendMessage(${sessionId}) to=${params.to}`);
     let session = this.sessions.get(sessionId);
-
-    // If not in memory, try to load from disk
     if (!session && this.sessionExistsOnDisk(sessionId)) {
       session = await this.loadSessionFromDisk(sessionId);
     }
-
     if (!session) {
       throw new Error('Session not found');
     }
-
     if (session.status !== 'ready') {
       throw new Error('Session not ready');
     }
 
     const { to, text, media, options = {} } = params;
-
-    // Validate that we have content to send
     if (!text && !media) {
       throw new Error('Must provide either text or media');
     }
 
-    // Format phone number
     const formattedNumber = this.formatPhoneNumber(to);
     const chatId = formattedNumber + '@c.us';
-
     let content;
 
-    // Handle media if provided
     if (media) {
       try {
         const { url, base64, mimetype, filename } = media;
-
         if (url) {
-          // From URL
+          console.log(`[SessionManager] Fetching media from URL for ${sessionId}`);
           content = await MessageMedia.fromUrl(url);
         } else if (base64 && mimetype) {
-          // From base64 data
+          console.log(`[SessionManager] Using base64 media for ${sessionId}`);
           content = new MessageMedia(mimetype, base64, filename);
         } else {
           throw new Error('Media must include either url or base64+mimetype');
         }
-      } catch (error) {
-        throw new Error(`Failed to process media: ${error.message}`);
+      } catch (err) {
+        console.error(`[SessionManager] Failed to process media for ${sessionId}:`, err.message);
+        throw new Error(`Failed to process media: ${err.message}`);
       }
     } else {
-      // Plain text message
       content = text;
     }
 
-    // Send the message
     const message = await session.client.sendMessage(chatId, content, options);
+    console.log(`[SessionManager] Message sent from ${sessionId} to ${formattedNumber}`);
 
     return {
       success: true,
@@ -389,49 +334,44 @@ export class SessionManager extends EventEmitter {
     };
   }
 
-  // Destroy session
   async destroySession(sessionId) {
+    console.log(`[SessionManager] destroySession(${sessionId})`);
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new Error('Session not found');
     }
-
     try {
       if (session.client) {
         await session.client.destroy();
       }
-    } catch (error) {
-      console.error(`Error destroying session ${sessionId}:`, error);
+      console.log(`[SessionManager] Session ${sessionId} client destroyed`);
+    } catch (err) {
+      console.error(`[SessionManager] Error destroying session ${sessionId}:`, err.message);
     }
-
     this.sessions.delete(sessionId);
     this.qrStates.delete(sessionId);
   }
 
-  // Get all sessions (both in memory and on disk)
   async getAllSessions() {
+    console.log(`[SessionManager] getAllSessions()`);
     const inMemory = Array.from(this.sessions.keys());
-
     let onDisk = [];
     try {
       onDisk = readdirSync(this.AUTH_DIR)
-        .filter((dir) => dir.startsWith('session-'))
-        .map((dir) => dir.replace('session-', ''));
-    } catch (error) {
-      // AUTH_DIR might not exist yet
-      console.warn('Could not read auth directory:', error.message);
+        .filter((d) => d.startsWith('session-'))
+        .map((d) => d.replace('session-', ''));
+    } catch (err) {
+      console.warn(`[SessionManager] Could not read auth dir:`, err.message);
     }
-
-    // Combine and deduplicate
-    const allSessions = [...new Set([...inMemory, ...onDisk])];
-    return allSessions;
+    const all = [...new Set([...inMemory, ...onDisk])];
+    console.log(`[SessionManager] Found ${all.length} sessions`);
+    return all;
   }
 
-  // Get health status
   async getHealthStatus() {
+    console.log(`[SessionManager] getHealthStatus()`);
     const sessions = Array.from(this.sessions.values());
     const allSessions = await this.getAllSessions();
-
     return {
       status: 'ok',
       uptime: process.uptime(),
@@ -449,80 +389,96 @@ export class SessionManager extends EventEmitter {
     };
   }
 
-  // Shutdown all sessions
   async shutdown() {
-    const promises = Array.from(this.sessions.keys()).map((sessionId) =>
-      this.destroySession(sessionId).catch((err) =>
-        console.error(`Error destroying session ${sessionId} during shutdown:`, err)
+    console.log(`[SessionManager] shutdown() called`);
+    const promises = Array.from(this.sessions.keys()).map((sid) =>
+      this.destroySession(sid).catch((err) =>
+        console.error(`[SessionManager] Error destroying ${sid} during shutdown:`, err.message)
       )
     );
-
     await Promise.all(promises);
   }
 
-  // Set up client event handlers
+  async callWebhook(url, payload) {
+    console.log(`[SessionManager] callWebhook -> ${url}`);
+    try {
+      const response = await axios.post(url, payload, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 5000,
+      });
+      console.log(`[SessionManager] Webhook success: ${response.status}`);
+      return response.data;
+    } catch (err) {
+      console.error(`[SessionManager] Webhook call failed:`, err.message);
+    }
+  }
+
   setupClientEvents(sessionId, client) {
     const session = this.sessions.get(sessionId);
 
-    // QR Code
     client.on('qr', (qr) => {
-      console.log(`QR received for session ${sessionId}`);
+      console.log(`[SessionManager] QR received for ${sessionId}`);
       session.status = 'qr';
       session.qr = qr;
       this.emit('session:qr', { sessionId, qr });
     });
 
-    // Authenticated
     client.on('authenticated', () => {
-      console.log(`Session ${sessionId} authenticated`);
+      console.log(`[SessionManager] Session ${sessionId} authenticated`);
       session.status = 'authenticated';
       session.qr = null;
-
-      // Clear QR state
       const qrState = this.qrStates.get(sessionId);
       if (qrState) {
         qrState.active = false;
       }
-
       this.emit('session:authenticated', { sessionId });
     });
 
-    // Ready
+    client.on('message_create', (message) => {
+      console.log(`[SessionManager] Incoming message for ${sessionId}`);
+      const isValidUrl = (val) => {
+        try {
+          new URL(val);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      if (session.webhook && isValidUrl(session.webhook)) {
+        console.log(`[SessionManager] Forwarding message to webhook: ${session.webhook}`);
+        this.callWebhook(session.webhook, { sessionId, message });
+      } else {
+        console.log(`[SessionManager] Webhook invalid or not set for ${sessionId}`);
+      }
+      if (message.body === '!ping') {
+        client.sendMessage(message.from, 'pong');
+      }
+    });
+
     client.on('ready', () => {
-      console.log(`Session ${sessionId} ready`);
+      console.log(`[SessionManager] Session ${sessionId} ready`);
       session.status = 'ready';
       session.info = client.info;
       this.emit('session:ready', { sessionId, info: client.info });
     });
 
-    // Auth failure
     client.on('auth_failure', (msg) => {
-      console.error(`Auth failure for session ${sessionId}:`, msg);
+      console.error(`[SessionManager] Auth failure for ${sessionId}:`, msg);
       session.status = 'auth_failure';
       session.error = msg;
       this.emit('session:auth_failure', { sessionId, message: msg });
     });
 
-    // Disconnected
     client.on('disconnected', (reason) => {
-      console.log(`Session ${sessionId} disconnected:`, reason);
-      session.status = 'disconnected';
+      console.log(`[SessionManager] Session ${sessionId} disconnected: ${reason}`);
+      session.status = reason === 'LOGOUT' ? 'logged_out' : 'disconnected';
       session.disconnectReason = reason;
-
-      // Clear QR state
       this.qrStates.delete(sessionId);
-
-      // Handle different disconnect reasons
-      if (reason === 'LOGOUT') {
-        // User logged out - session invalid
-        session.status = 'logged_out';
-      }
-
       this.emit('session:disconnected', { sessionId, reason });
     });
 
-    // Messages
-    client.on('message', async (msg) => {
+    client.on('message', (msg) => {
+      console.log(`[SessionManager] Message received in ${sessionId} from ${msg.from}`);
       this.emit('message:received', {
         sessionId,
         message: {
@@ -536,22 +492,12 @@ export class SessionManager extends EventEmitter {
     });
   }
 
-  // Format phone number for WhatsApp
   formatPhoneNumber(phone) {
-    // Remove all non-digits
     let cleaned = phone.replace(/\D/g, '');
-
-    // Handle Brazilian numbers (remove 9th digit)
-    if (cleaned.startsWith('55') && cleaned.length === 13) {
-      const areaCode = cleaned.substring(2, 4);
-      const ninthDigit = cleaned.substring(4, 5);
-      const number = cleaned.substring(5);
-
-      if (ninthDigit === '9') {
-        cleaned = '55' + areaCode + number;
-      }
+    if (cleaned.startsWith('55') && cleaned.length === 13 && cleaned[4] === '9') {
+      cleaned = '55' + cleaned.substring(2, 4) + cleaned.substring(5);
     }
-
+    console.log(`[SessionManager] formatPhoneNumber(${phone}) -> ${cleaned}`);
     return cleaned;
   }
 }
